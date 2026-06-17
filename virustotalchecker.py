@@ -1,7 +1,6 @@
 # modules/vtcheck.py
-# requires: aiohttp
-# scope: pip
-# (c) @Scp079OldAi
+# meta developer: @Scp079Modules
+# meta banner: https://www.malwarebytes.com/wp-content/uploads/sites/2/2021/05/asset_upload_file13254_232175.png
 # License: MIT - You can modify this file but must keep author credit
 
 import asyncio
@@ -23,9 +22,11 @@ CACHE_TTL = 60 * 20
 BIG_FILE_THRESHOLD = 32 * 1024 * 1024
 MAX_FILE_SIZE_HARD = 650 * 1024 * 1024
 PAGE_SIZE = 10
+HISTORY_PAGE_SIZE = 8
 HTTP_TOTAL_TIMEOUT = 180
 ANALYSIS_POLLS = 20
 ANALYSIS_DELAY = 8
+HISTORY_DB_KEY = "vtchecker_history"
 
 
 @dataclass
@@ -36,17 +37,17 @@ class CachedResult:
 
 @loader.tds
 class VirusTotalChecker(loader.Module):
-    """VirusTotal checker with config-based API key setup"""
+    """VirusTotal module for hash, file, and URL analysis via the VT API"""
 
     strings = {"name": "VirusTotalChecker"}
 
     strings_ru = {
         "config_missing": "❌ API-ключ VirusTotal не настроен. Укажите его через конфиг модуля.",
-        "no_input": "❌ Объект для проверки не указан.\n\nОтветьте на файл или сообщение со ссылкой, либо передайте ссылку в тексте команды.",
+        "no_input": "❌ Объект для проверки не указан.\n\nОтветьте на файл, ссылку или сообщение со ссылкой, либо передайте ссылку в тексте команды.",
         "downloading": "📥 Выполняется загрузка файла...",
         "uploading": "📤 Выполняется отправка файла на анализ...\n📄 Имя: {filename}\n📦 Размер: {size}",
         "checking_url": "🔗 Выполняется проверка URL...\n{url}",
-        "rechecking_url": "🔄 Выполняется повторный анализ URL...\n{url}",
+        "checking_hash": "🔑 Выполняется проверка hash...\n{sha256}",
         "reanalyzing_file": "🔄 Выполняется повторный анализ файла...\n{sha256}",
         "too_big": "❌ Размер файла превышает допустимый предел VirusTotal.\nМаксимум: до 650 МБ через upload URL\nРазмер файла: {size}",
         "download_error": "❌ Не удалось загрузить файл.\n{error}",
@@ -71,6 +72,10 @@ class VirusTotalChecker(loader.Module):
             "🛡️ ОТЧЁТ ПО URL\n\n"
             "🔗 Адрес: {url}\n\n"
         ),
+        "results_hash": (
+            "🛡️ ОТЧЁТ ПО HASH\n\n"
+            "🔑 SHA-256: {sha256}\n\n"
+        ),
         "stats_line": (
             "📊 Результаты анализа:\n"
             "🔴 Вредоносные: {malicious}\n"
@@ -89,36 +94,49 @@ class VirusTotalChecker(loader.Module):
         "btn_next": "▶ Вперёд",
         "btn_delete": "🗑 Удалить",
         "btn_report": "📄 Отчёт",
-        "btn_recheck": "🔄 Повторить",
+        "btn_history": "🕘 История",
+        "btn_clear_history": "🧹 Очистить историю",
+        "btn_confirm_yes": "✅ Да",
+        "btn_confirm_no": "❌ Нет",
+        "btn_back_history": "↩️ В историю",
+        "btn_back_list": "◀ Назад к списку",
+        "btn_open_full": "📑 Полный отчёт",
+        "btn_delete_record": "🗑 Удалить запись",
+        "history_title": "🕘 История VirusTotal",
+        "history_empty": "🕘 История пуста.",
+        "history_list_hint": "Нажмите на запись, чтобы открыть мини-отчёт.",
+        "history_short": (
+            "🕘 МИНИ-ОТЧЁТ\n\n"
+            "📄 Имя: {filename}\n"
+            "📦 Размер: {size}\n"
+            "📁 Формат: {filetype}\n"
+            "🔎 Детекты: {detections}\n"
+            "🕒 Проверка: {checked_at}\n"
+        ),
+        "history_full": "📑 ПОЛНЫЙ ОТЧЁТ ИЗ ИСТОРИИ",
+        "history_delete_confirm": "Удалить запись?",
+        "history_clear_confirm": "Удалить всю историю?",
+        "history_cleared": "🧹 История очищена.",
+        "record_deleted": "🗑 Запись удалена.",
+        "record_not_found": "❌ Запись не найдена.",
         "help_text": (
-            "🛡️ VirusTotalChecker — справка\n\n"
-            "Настройка API-ключа:\n"
-            "1. Открой https://www.virustotal.com и войди в аккаунт.\n"
-            "2. Перейди на страницу API-ключа:\n"
-            "   https://www.virustotal.com/gui/my-apikey\n"
-            "3. Скопируй персональный API-ключ.\n"
-            "4. Открой конфиг модуля: .cfg VirusTotalChecker\n"
-            "5. В параметре api_key укажи скопированный ключ.\n\n"
-            "Важно:\n"
-            "• Не отправляй API-ключ в открытые чаты.\n"
-            "• Храни ключ только в конфиге модуля.\n\n"
+            "🛡️ VirusTotalChecker\n\n"
+            "Модуль для проверки SHA-256 hash, файлов и URL через VirusTotal API.\n\n"
             "Команды:\n"
-            "• {prefix}vtcheck <url> — проверить ссылку\n"
-            "• Ответ на файл + {prefix}vtcheck — проверить файл\n"
-            "• {prefix}vtrecheck <url> — повторный анализ ссылки\n"
-            "• Ответ на файл + {prefix}vtrecheck — повторный анализ файла\n"
-            "• {prefix}vtstatus — состояние модуля\n"
-            "• {prefix}vthelp — показать эту справку"
+            "• {prefix}chash [hash] — Проверить hash файла\n"
+            "• Ответ на файл, ссылка или ответ на ссылку + {prefix}vtcheck — проверка через VirusTotal\n"
+            "• {prefix}vthistory — Показать историю проверок\n"
+            "• {prefix}vthelp — показать эту справку\n"
         ),
     }
 
     strings_en = {
         "config_missing": "❌ VirusTotal API key is not configured. Set it through module config.",
-        "no_input": "❌ No object was provided for analysis.\n\nReply to a file or a message with a URL, or pass a URL in the command text.",
+        "no_input": "❌ No object was provided for analysis.\n\nReply to a file, a URL, or a message with a URL, or pass a URL in the command text.",
         "downloading": "📥 Downloading file...",
         "uploading": "📤 Uploading file for analysis...\n📄 Name: {filename}\n📦 Size: {size}",
         "checking_url": "🔗 Checking URL...\n{url}",
-        "rechecking_url": "🔄 Reanalyzing URL...\n{url}",
+        "checking_hash": "🔑 Checking hash...\n{sha256}",
         "reanalyzing_file": "🔄 Reanalyzing file...\n{sha256}",
         "too_big": "❌ File size exceeds the VirusTotal limit.\nMaximum: up to 650 MB via upload URL\nFile size: {size}",
         "download_error": "❌ Failed to download the file.\n{error}",
@@ -143,6 +161,10 @@ class VirusTotalChecker(loader.Module):
             "🛡️ URL REPORT\n\n"
             "🔗 Address: {url}\n\n"
         ),
+        "results_hash": (
+            "🛡️ HASH REPORT\n\n"
+            "🔑 SHA-256: {sha256}\n\n"
+        ),
         "stats_line": (
             "📊 Analysis results:\n"
             "🔴 Malicious: {malicious}\n"
@@ -161,26 +183,39 @@ class VirusTotalChecker(loader.Module):
         "btn_next": "▶ Next",
         "btn_delete": "🗑 Delete",
         "btn_report": "📄 Report",
-        "btn_recheck": "🔄 Recheck",
+        "btn_history": "🕘 History",
+        "btn_clear_history": "🧹 Clear history",
+        "btn_confirm_yes": "✅ Yes",
+        "btn_confirm_no": "❌ No",
+        "btn_back_history": "↩️ History",
+        "btn_back_list": "◀ Back to list",
+        "btn_open_full": "📑 Full report",
+        "btn_delete_record": "🗑 Delete record",
+        "history_title": "🕘 VirusTotal history",
+        "history_empty": "🕘 History is empty.",
+        "history_list_hint": "Press an entry to open a short report.",
+        "history_short": (
+            "🕘 SHORT REPORT\n\n"
+            "📄 Name: {filename}\n"
+            "📦 Size: {size}\n"
+            "📁 Format: {filetype}\n"
+            "🔎 Detections: {detections}\n"
+            "🕒 Checked: {checked_at}\n"
+        ),
+        "history_full": "📑 FULL REPORT FROM HISTORY",
+        "history_delete_confirm": "Delete record?",
+        "history_clear_confirm": "Delete all history?",
+        "history_cleared": "🧹 History cleared.",
+        "record_deleted": "🗑 Record deleted.",
+        "record_not_found": "❌ Record not found.",
         "help_text": (
-            "🛡️ VirusTotalChecker — help\n\n"
-            "API key setup:\n"
-            "1. Open https://www.virustotal.com and sign in.\n"
-            "2. Open your API key page:\n"
-            "   https://www.virustotal.com/gui/my-apikey\n"
-            "3. Copy your personal API key.\n"
-            "4. Open module config: .cfg VirusTotalChecker\n"
-            "5. Paste the copied key into the api_key field.\n\n"
-            "Important:\n"
-            "• Do not send your API key in public chats.\n"
-            "• Store the key only in module config.\n\n"
+            "🛡️ VirusTotalChecker\n\n"
+            "Module for SHA-256 hash, file, and URL analysis through the VirusTotal API.\n\n"
             "Commands:\n"
-            "• {prefix}vtcheck <url> — check URL\n"
-            "• Reply to a file + {prefix}vtcheck — check file\n"
-            "• {prefix}vtrecheck <url> — reanalyze URL\n"
-            "• Reply to a file + {prefix}vtrecheck — reanalyze file\n"
-            "• {prefix}vtstatus — module status\n"
-            "• {prefix}vthelp — show this help"
+            "• {prefix}chash [hash] — Check file hash\n"
+            "• Reply to a file, URL, or reply to a URL + {prefix}vtcheck — VirusTotal scan\n"
+            "• {prefix}vthistory — Show scan history\n"
+            "• {prefix}vthelp — show this help\n"
         ),
     }
 
@@ -191,6 +226,7 @@ class VirusTotalChecker(loader.Module):
         self.prefix = "."
         self.cache: Dict[str, CachedResult] = {}
         self.inline_states: Dict[str, CachedResult] = {}
+        self.history: List[dict] = []
         self.last_429_until = 0.0
         self.last_backoff = 2.0
 
@@ -212,6 +248,9 @@ class VirusTotalChecker(loader.Module):
         self.db = db
         self.lang = db.get("hikka.loader", "lang", "ru")
         self.prefix = db.get("hikka.loader", "prefix", ".")
+        raw = self.db.get(self.__class__.__name__, HISTORY_DB_KEY, [])
+        if isinstance(raw, list):
+            self.history = raw
 
     @property
     def api_key(self):
@@ -271,6 +310,9 @@ class VirusTotalChecker(loader.Module):
         found = re.findall(pattern, text)
         return self._clean_url(found[0]) if found else None
 
+    def _is_sha256(self, text: str) -> bool:
+        return bool(re.fullmatch(r"[A-Fa-f0-9]{64}", (text or "").strip()))
+
     def _format_size(self, size: int) -> str:
         if size < 1024:
             return f"{size} Б" if self.lang == "ru" else f"{size} B"
@@ -288,11 +330,173 @@ class VirusTotalChecker(loader.Module):
     def _report_url(self, result: dict) -> str:
         if result["type"] == "file":
             return f"https://www.virustotal.com/gui/file/{result['sha256']}/detection"
+        if result["type"] == "hash":
+            return f"https://www.virustotal.com/gui/file/{result['sha256']}/detection"
         return f"https://www.virustotal.com/gui/url/{result['id']}/detection"
 
     def _state_key(self, result: dict) -> str:
-        base = result["sha256"] if result["type"] == "file" else result["id"]
+        base = result["sha256"] if result["type"] in ("file", "hash") else result["id"]
         return hashlib.md5(base.encode()).hexdigest()[:16]
+
+    def _history_key(self, item: dict) -> str:
+        return item.get("key") or item.get("sha256") or item.get("url") or item.get("id") or item.get("filename", "")
+
+    def _history_find_index(self, key: str) -> int:
+        for i, item in enumerate(self.history):
+            if self._history_key(item) == key:
+                return i
+        return -1
+
+    def _history_item_from_state(self, state: dict) -> dict:
+        res = state.get("result", {})
+        meta = state.get("meta", {})
+        key = meta.get("sha256") or meta.get("url") or res.get("sha256") or res.get("id") or meta.get("filename", "")
+        stats = res.get("stats", {})
+        threats = res.get("threats", [])
+        return {
+            "key": key,
+            "type": res.get("type"),
+            "filename": meta.get("filename", "unknown"),
+            "size": meta.get("size", "?"),
+            "filetype": meta.get("filetype", "?"),
+            "sha256": meta.get("sha256"),
+            "url": meta.get("url"),
+            "stats": stats,
+            "threats": threats,
+            "checked_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "result": res,
+            "meta": meta,
+        }
+
+    def _save_history(self):
+        if self.db:
+            self.db.set(self.__class__.__name__, HISTORY_DB_KEY, self.history)
+
+    def _history_add(self, state: dict):
+        item = self._history_item_from_state(state)
+        key = item.get("key")
+        if not key:
+            return
+        idx = self._history_find_index(key)
+        if idx != -1:
+            self.history[idx] = item
+        else:
+            self.history.insert(0, item)
+        self._save_history()
+
+    def _history_delete_one(self, key: str) -> bool:
+        idx = self._history_find_index(key)
+        if idx == -1:
+            return False
+        self.history.pop(idx)
+        self._save_history()
+        return True
+
+    def _history_clear(self):
+        self.history.clear()
+        self._save_history()
+
+    def _history_pages(self) -> int:
+        return max(1, math.ceil(len(self.history) / HISTORY_PAGE_SIZE))
+
+    def _history_slice(self, page: int):
+        pages = self._history_pages()
+        page = max(1, min(page, pages))
+        start = (page - 1) * HISTORY_PAGE_SIZE
+        end = start + HISTORY_PAGE_SIZE
+        return page, pages, self.history[start:end]
+
+    def _history_button_label(self, item: dict) -> str:
+        name = item.get("filename") or item.get("url") or item.get("sha256") or "unknown"
+        return name if len(name) <= 36 else name[:33] + "..."
+
+    def _history_short_text(self, item: dict) -> str:
+        detections = len(item.get("threats", []))
+        return self._(
+            "history_short",
+            filename=item.get("filename", "unknown"),
+            size=item.get("size", "?"),
+            filetype=item.get("filetype", "?"),
+            detections=detections,
+            checked_at=item.get("checked_at", "?"),
+        )
+
+    def _history_full_text(self, item: dict) -> str:
+        state = {"page": 1, "result": item.get("result", {}), "meta": item.get("meta", {})}
+        return self._render_result_text(state)
+
+    def _confirm_markup(self, yes_cb, yes_args, no_cb, no_args):
+        return [[
+            {"text": self._("btn_confirm_yes"), "callback": yes_cb, "args": yes_args},
+            {"text": self._("btn_confirm_no"), "callback": no_cb, "args": no_args},
+        ]]
+
+    def _build_markup(self, state_key: str, show_history: bool = False):
+        state = self._inline_get(state_key)
+        if not state:
+            return [[{"text": self._("btn_delete"), "callback": self._cb_delete, "args": (state_key,)}]]
+
+        res = state["result"]
+        threats = res.get("threats", [])
+        pages = max(1, math.ceil(max(1, len(threats)) / PAGE_SIZE))
+        page = ((state["page"] - 1) % pages) + 1
+        report_url = self._report_url(res)
+
+        markup = []
+        if threats and pages > 1:
+            markup.append([
+                {"text": self._("btn_prev"), "callback": self._cb_prev, "args": (state_key,)},
+                {"text": f"{page}/{pages}", "callback": self._cb_noop, "args": (state_key,)},
+                {"text": self._("btn_next"), "callback": self._cb_next, "args": (state_key,)},
+            ])
+
+        action_row = [{"text": self._("btn_report"), "url": report_url}]
+        if show_history:
+            action_row.append({"text": self._("btn_history"), "callback": self._cb_history_from_report, "args": (state_key,)})
+        action_row.append({"text": self._("btn_delete"), "callback": self._cb_delete, "args": (state_key,)})
+        markup.append(action_row)
+        return markup
+
+    def _history_list_markup(self, page: int):
+        page, pages, items = self._history_slice(page)
+        markup = []
+        for item in items:
+            markup.append([{
+                "text": self._history_button_label(item),
+                "callback": self._cb_history_open,
+                "args": (item["key"], page),
+            }])
+        nav = []
+        if pages > 1:
+            nav.append({"text": self._("btn_prev"), "callback": self._cb_history_prev, "args": (page,)})
+            nav.append({"text": f"{page}/{pages}", "callback": self._cb_noop, "args": ("history",)})
+            nav.append({"text": self._("btn_next"), "callback": self._cb_history_next, "args": (page,)})
+            markup.append(nav)
+        markup.append([
+            {"text": self._("btn_clear_history"), "callback": self._cb_history_clear_confirm, "args": ()},
+            {"text": self._("btn_delete"), "callback": self._cb_delete_message, "args": ("history_list",)},
+        ])
+        return markup
+
+    def _history_short_markup(self, key: str, back_page: int):
+        return [
+            [{"text": self._("btn_open_full"), "callback": self._cb_history_full, "args": (key, back_page)}],
+            [
+                {"text": self._("btn_back_history"), "callback": self._cb_history_back_list, "args": (back_page,)},
+                {"text": self._("btn_delete_record"), "callback": self._cb_history_delete_confirm, "args": (key, back_page)},
+            ],
+            [{"text": self._("btn_delete"), "callback": self._cb_delete_message, "args": ("history_short",)}],
+        ]
+
+    def _history_full_markup(self, key: str, back_page: int):
+        return [
+            [{"text": self._("btn_back_history"), "callback": self._cb_history_back_short, "args": (key, back_page)}],
+            [
+                {"text": self._("btn_delete_record"), "callback": self._cb_history_delete_confirm, "args": (key, back_page)},
+                {"text": self._("btn_back_list"), "callback": self._cb_history_back_list, "args": (back_page,)},
+            ],
+            [{"text": self._("btn_delete"), "callback": self._cb_delete_message, "args": ("history_full",)}],
+        ]
 
     async def _respect_backoff(self):
         now = time.time()
@@ -304,7 +508,6 @@ class VirusTotalChecker(loader.Module):
             return {"error": "auth"}
 
         await self._respect_backoff()
-
         headers = dict(self._headers())
         headers.update(kwargs.pop("headers", {}))
         timeout = kwargs.pop("timeout", aiohttp.ClientTimeout(total=HTTP_TOTAL_TIMEOUT))
@@ -341,7 +544,7 @@ class VirusTotalChecker(loader.Module):
                         wait_for = max(1, int(retry_after))
                     else:
                         wait_for = int(min(self.last_backoff, 60))
-                        self.last_backoff = min(self.last_backoff * 2, 60)
+                    self.last_backoff = min(self.last_backoff * 2, 60)
                     self.last_429_until = time.time() + wait_for
                     if retry > 0:
                         await asyncio.sleep(wait_for)
@@ -560,6 +763,8 @@ class VirusTotalChecker(loader.Module):
                 filetype=meta["filetype"],
                 sha256=meta["sha256"],
             )
+        elif res["type"] == "hash":
+            text = self._("results_hash", sha256=meta["sha256"])
         else:
             text = self._("results_url", url=meta["url"])
 
@@ -580,7 +785,7 @@ class VirusTotalChecker(loader.Module):
             return text
 
         pages = max(1, math.ceil(len(threats) / PAGE_SIZE))
-        page = max(1, min(page, pages))
+        page = ((page - 1) % pages) + 1
         start = (page - 1) * PAGE_SIZE
         end = start + PAGE_SIZE
 
@@ -590,43 +795,13 @@ class VirusTotalChecker(loader.Module):
 
         return text
 
-    def _build_markup(self, state_key: str):
-        state = self._inline_get(state_key)
-        if not state:
-            return [[{"text": self._("btn_delete"), "callback": self._cb_delete, "args": (state_key,)}]]
-
-        res = state["result"]
-        threats = res.get("threats", [])
-        pages = max(1, math.ceil(max(1, len(threats)) / PAGE_SIZE))
-        page = state["page"]
-        report_url = self._report_url(res)
-
-        nav_row = []
-        if threats and pages > 1:
-            nav_row = [
-                {"text": self._("btn_prev"), "callback": self._cb_prev, "args": (state_key,)},
-                {"text": f"{page}/{pages}", "callback": self._cb_noop, "args": (state_key,)},
-                {"text": self._("btn_next"), "callback": self._cb_next, "args": (state_key,)},
-            ]
-
-        action_row = [
-            {"text": self._("btn_report"), "url": report_url},
-            {"text": self._("btn_recheck"), "callback": self._cb_recheck, "args": (state_key,)},
-            {"text": self._("btn_delete"), "callback": self._cb_delete, "args": (state_key,)},
-        ]
-
-        markup = []
-        if nav_row:
-            markup.append(nav_row)
-        markup.append(action_row)
-        return markup
-
     async def _answer_inline(self, msg, state: dict):
         state_key = self._state_key(state["result"])
         self._inline_set(state_key, state)
+        self._history_add(state)
 
         text = self._render_result_text(state)
-        markup = self._build_markup(state_key)
+        markup = self._build_markup(state_key, show_history=False)
 
         if hasattr(self, "inline") and hasattr(self.inline, "form"):
             await self.inline.form(
@@ -649,7 +824,7 @@ class VirusTotalChecker(loader.Module):
             return
 
         text = self._render_result_text(state)
-        markup = self._build_markup(state_key)
+        markup = self._build_markup(state_key, show_history=False)
 
         try:
             await call.edit(text, reply_markup=markup)
@@ -659,7 +834,26 @@ class VirusTotalChecker(loader.Module):
             except Exception:
                 pass
 
-    async def _cb_noop(self, call, state_key: str):
+    async def _edit_history_list(self, call, page: int):
+        if not self.history:
+            try:
+                await call.edit(self._("history_empty"), reply_markup=[
+                    [{"text": self._("btn_delete"), "callback": self._cb_delete_message, "args": ("history_empty",)}]
+                ])
+            except Exception:
+                pass
+            return
+        page, pages, _ = self._history_slice(page)
+        text = self._("history_title") + "\n\n" + self._("history_list_hint")
+        try:
+            await call.edit(text, reply_markup=self._history_list_markup(page))
+        except Exception:
+            try:
+                await call.answer(self._("inline_expired"), show_alert=True)
+            except Exception:
+                pass
+
+    async def _cb_noop(self, call, *args):
         try:
             await call.answer()
         except Exception:
@@ -670,7 +864,9 @@ class VirusTotalChecker(loader.Module):
         if not state:
             await call.answer(self._("inline_expired"), show_alert=True)
             return
-        state["page"] = max(1, state["page"] - 1)
+        threats = state["result"].get("threats", [])
+        pages = max(1, math.ceil(max(1, len(threats)) / PAGE_SIZE))
+        state["page"] = pages if state["page"] <= 1 else state["page"] - 1
         self._inline_set(state_key, state)
         await self._edit_inline(call, state_key)
 
@@ -681,7 +877,7 @@ class VirusTotalChecker(loader.Module):
             return
         threats = state["result"].get("threats", [])
         pages = max(1, math.ceil(max(1, len(threats)) / PAGE_SIZE))
-        state["page"] = min(pages, state["page"] + 1)
+        state["page"] = 1 if state["page"] >= pages else state["page"] + 1
         self._inline_set(state_key, state)
         await self._edit_inline(call, state_key)
 
@@ -695,40 +891,117 @@ class VirusTotalChecker(loader.Module):
             except Exception:
                 pass
 
-    async def _cb_recheck(self, call, state_key: str):
+    async def _cb_history_from_report(self, call, state_key: str):
         state = self._inline_get(state_key)
         if not state:
             await call.answer(self._("inline_expired"), show_alert=True)
             return
+        await self._show_history_from_state(call, state, 1)
 
+    async def _show_history_from_state(self, call, state: dict, page: int):
+        item = self._history_item_from_state(state)
+        key = item["key"]
+        idx = self._history_find_index(key)
+        if idx == -1:
+            self.history.insert(0, item)
+            self._save_history()
+        text = self._history_short_text(item)
         try:
-            await call.answer()
+            await call.edit(text, reply_markup=self._history_short_markup(key, page))
         except Exception:
-            pass
-
-        res = state["result"]
-        if res["type"] == "url":
-            new_res = await self._scan_url(state["meta"]["url"], force=True)
-        else:
-            new_res = await self._scan_file(
-                state["meta"]["sha256"],
-                filepath=None,
-                filename=state["meta"]["filename"],
-                force=True,
-            )
-
-        if not new_res or (isinstance(new_res, dict) and new_res.get("error")):
-            err = new_res.get("error", "unknown") if isinstance(new_res, dict) else "unknown"
             try:
-                await call.answer(self._("api_error", error=err), show_alert=True)
+                await call.answer(self._("inline_expired"), show_alert=True)
             except Exception:
                 pass
-            return
 
-        state["result"] = new_res
-        state["page"] = 1
-        self._inline_set(state_key, state)
-        await self._edit_inline(call, state_key)
+    async def _cb_history_prev(self, call, page: int):
+        await call.answer()
+        await self._edit_history_list(call, page - 1)
+
+    async def _cb_history_next(self, call, page: int):
+        await call.answer()
+        await self._edit_history_list(call, page + 1)
+
+    async def _cb_history_open(self, call, key: str, back_page: int):
+        idx = self._history_find_index(key)
+        if idx == -1:
+            await call.answer(self._("record_not_found"), show_alert=True)
+            return
+        item = self.history[idx]
+        text = self._history_short_text(item)
+        await call.edit(text, reply_markup=self._history_short_markup(key, back_page))
+
+    async def _cb_history_full(self, call, key: str, back_page: int):
+        idx = self._history_find_index(key)
+        if idx == -1:
+            await call.answer(self._("record_not_found"), show_alert=True)
+            return
+        item = self.history[idx]
+        text = self._("history_full") + "\n\n" + self._history_full_text(item)
+        await call.edit(text, reply_markup=self._history_full_markup(key, back_page))
+
+    async def _cb_history_back_list(self, call, back_page: int):
+        await call.answer()
+        await self._edit_history_list(call, back_page)
+
+    async def _cb_history_back_short(self, call, key: str, back_page: int):
+        idx = self._history_find_index(key)
+        if idx == -1:
+            await call.answer(self._("record_not_found"), show_alert=True)
+            return
+        item = self.history[idx]
+        await call.edit(self._history_short_text(item), reply_markup=self._history_short_markup(key, back_page))
+
+    async def _cb_history_delete_confirm(self, call, key: str, back_page: int):
+        await call.edit(
+            self._("history_delete_confirm"),
+            reply_markup=self._confirm_markup(
+                self._cb_history_delete_yes, (key, back_page),
+                self._cb_history_delete_no, (key, back_page),
+            ),
+        )
+
+    async def _cb_history_delete_yes(self, call, key: str, back_page: int):
+        if not self._history_delete_one(key):
+            await call.answer(self._("record_not_found"), show_alert=True)
+            return
+        await call.answer(self._("record_deleted"))
+        await self._edit_history_list(call, back_page)
+
+    async def _cb_history_delete_no(self, call, key: str, back_page: int):
+        idx = self._history_find_index(key)
+        if idx == -1:
+            await call.answer(self._("record_not_found"), show_alert=True)
+            return
+        item = self.history[idx]
+        await call.edit(self._history_short_text(item), reply_markup=self._history_short_markup(key, back_page))
+
+    async def _cb_history_clear_confirm(self, call):
+        await call.edit(
+            self._("history_clear_confirm"),
+            reply_markup=self._confirm_markup(
+                self._cb_history_clear_yes, (),
+                self._cb_history_clear_no, (),
+            ),
+        )
+
+    async def _cb_history_clear_yes(self, call):
+        self._history_clear()
+        await call.edit(self._("history_empty"), reply_markup=[
+            [{"text": self._("btn_delete"), "callback": self._cb_delete_message, "args": ("history_empty",)}]
+        ])
+
+    async def _cb_history_clear_no(self, call):
+        await self._edit_history_list(call, 1)
+
+    async def _cb_delete_message(self, call, *_):
+        try:
+            await call.delete()
+        except Exception:
+            try:
+                await call.edit(self._("deleted"), reply_markup=None)
+            except Exception:
+                pass
 
     async def _show_error(self, msg_or_status, err: str):
         mapping = {
@@ -750,7 +1023,7 @@ class VirusTotalChecker(loader.Module):
 
     @loader.command()
     async def vthelpcmd(self, msg):
-        """Показать справку по настройке API-ключа и использованию модуля"""
+        """Показать справку по использованию модуля"""
         await utils.answer(msg, self._("help_text", prefix=self.prefix))
 
     @loader.command()
@@ -764,15 +1037,32 @@ class VirusTotalChecker(loader.Module):
 
     @loader.command()
     async def vtcheckcmd(self, msg):
-        """Проверить файл или ссылку через VirusTotal"""
+        """Проверить файл, URL или hash через VirusTotal"""
         await self._run_check(msg, force=False)
 
     @loader.command()
-    async def vtrecheckcmd(self, msg):
-        """Запустить повторный анализ файла или ссылки в VirusTotal"""
-        await self._run_check(msg, force=True)
+    async def vthistorycmd(self, msg):
+        """Показать историю проверок"""
+        if not self.history:
+            await utils.answer(msg, self._("history_empty"))
+            return
+        text = self._("history_title") + "\n\n" + self._("history_list_hint")
+        if hasattr(self, "inline") and hasattr(self.inline, "form"):
+            await self.inline.form(
+                text=text,
+                message=msg,
+                reply_markup=self._history_list_markup(1),
+                disable_security=True,
+            )
+            return
+        await utils.answer(msg, text)
 
-    async def _run_check(self, msg, force: bool = False):
+    @loader.command()
+    async def chashcmd(self, msg):
+        """Проверить SHA-256 hash файла через VirusTotal"""
+        await self._run_check(msg, force=False, hash_mode=True)
+
+    async def _run_check(self, msg, force: bool = False, hash_mode: bool = False):
         if not self.api_key:
             await utils.answer(msg, self._("config_missing"))
             return
@@ -780,24 +1070,36 @@ class VirusTotalChecker(loader.Module):
         tmpfile = None
 
         try:
-            cmd_args = utils.get_args_raw(msg)
+            cmd_args = utils.get_args_raw(msg).strip()
             url = self._extract_url(cmd_args)
+
+            if hash_mode:
+                sha256 = cmd_args.split()[0] if cmd_args else ""
+                if self._is_sha256(sha256):
+                    status = await utils.answer(msg, self._("checking_hash", sha256=sha256))
+                    res = await self._scan_file(sha256, filepath=None, filename="file.bin", force=force)
+                    if isinstance(res, dict) and res.get("error"):
+                        await self._show_error(status, res["error"])
+                        return
+                    state = {
+                        "page": 1,
+                        "result": res,
+                        "meta": {"filename": "file.bin", "size": "?", "filetype": "Unknown", "sha256": sha256},
+                    }
+                    await status.delete()
+                    await self._answer_inline(msg, state)
+                    return
 
             if url:
                 status = await utils.answer(
                     msg,
-                    self._("rechecking_url" if force else "checking_url", url=url[:200]),
+                    self._("checking_url", url=url[:200]),
                 )
                 res = await self._scan_url(url, force=force)
                 if isinstance(res, dict) and res.get("error"):
                     await self._show_error(status, res["error"])
                     return
-
-                state = {
-                    "page": 1,
-                    "result": res,
-                    "meta": {"url": url},
-                }
+                state = {"page": 1, "result": res, "meta": {"url": url}}
                 await status.delete()
                 await self._answer_inline(msg, state)
                 return
@@ -835,10 +1137,7 @@ class VirusTotalChecker(loader.Module):
                     sha256 = await self._compute_sha256(tmpfile)
                     ftype = self._get_file_type(fname)
 
-                    await status.edit(
-                        self._("reanalyzing_file", sha256=sha256) if force
-                        else self._("uploading", filename=fname[:80], size=size_fmt)
-                    )
+                    await status.edit(self._("reanalyzing_file", sha256=sha256) if force else self._("uploading", filename=fname[:80], size=size_fmt))
 
                     res = await self._scan_file(sha256, filepath=tmpfile, filename=fname, force=force)
                     if isinstance(res, dict) and res.get("error"):
@@ -865,18 +1164,13 @@ class VirusTotalChecker(loader.Module):
                     if url:
                         status = await utils.answer(
                             msg,
-                            self._("rechecking_url" if force else "checking_url", url=url[:200]),
+                            self._("checking_url", url=url[:200]),
                         )
                         res = await self._scan_url(url, force=force)
                         if isinstance(res, dict) and res.get("error"):
                             await self._show_error(status, res["error"])
                             return
-
-                        state = {
-                            "page": 1,
-                            "result": res,
-                            "meta": {"url": url},
-                        }
+                        state = {"page": 1, "result": res, "meta": {"url": url}}
                         await status.delete()
                         await self._answer_inline(msg, state)
                         return
