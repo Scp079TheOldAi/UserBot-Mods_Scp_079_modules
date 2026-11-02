@@ -6,11 +6,13 @@
 import asyncio
 import base64
 import hashlib
+import html
 import math
 import os
 import re
 import tempfile
 import time
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -94,6 +96,17 @@ class VirusTotalChecker(loader.Module):
         "btn_next": "▶ Вперёд",
         "btn_delete": "🗑 Удалить",
         "btn_report": "📄 Отчёт",
+        "btn_details": "📋 Details",
+        "btn_relations": "🔗 Relations",
+        "btn_behavior": "🧪 Behavior",
+        "btn_community": "💬 Community",
+        "btn_url_domain": "🌐 URL / Домен",
+        "btn_back_report": "↩️ К отчёту",
+        "extra_loading": "⏳ Загружаю дополнительные сведения...",
+        "extra_unavailable": "ℹ️ Дополнительные сведения недоступны для этого объекта или вашего уровня API.",
+        "extra_empty": "ℹ️ VirusTotal не вернул дополнительных сведений.",
+        "extra_error": "❌ Не удалось получить дополнительные сведения: {error}",
+        "extra_page": "Страница {page}/{pages}",
         "btn_history": "🕘 История",
         "btn_clear_history": "🧹 Очистить историю",
         "btn_confirm_yes": "✅ Да",
@@ -183,6 +196,17 @@ class VirusTotalChecker(loader.Module):
         "btn_next": "▶ Next",
         "btn_delete": "🗑 Delete",
         "btn_report": "📄 Report",
+        "btn_details": "📋 Details",
+        "btn_relations": "🔗 Relations",
+        "btn_behavior": "🧪 Behavior",
+        "btn_community": "💬 Community",
+        "btn_url_domain": "🌐 URL / Domain",
+        "btn_back_report": "↩️ Back to report",
+        "extra_loading": "⏳ Loading additional information...",
+        "extra_unavailable": "ℹ️ Additional information is unavailable for this object or your API tier.",
+        "extra_empty": "ℹ️ VirusTotal returned no additional information.",
+        "extra_error": "❌ Failed to get additional information: {error}",
+        "extra_page": "Page {page}/{pages}",
         "btn_history": "🕘 History",
         "btn_clear_history": "🧹 Clear history",
         "btn_confirm_yes": "✅ Yes",
@@ -455,6 +479,27 @@ class VirusTotalChecker(loader.Module):
             action_row.append({"text": self._("btn_history"), "callback": self._cb_history_from_report, "args": (state_key,)})
         action_row.append({"text": self._("btn_delete"), "callback": self._cb_delete, "args": (state_key,)})
         markup.append(action_row)
+
+        # Compact two-column navigation. Extra API data is fetched on demand.
+        if res.get("type") in ("file", "hash"):
+            markup.extend([
+                [
+                    {"text": self._("btn_details"), "callback": self._cb_extra_tab, "args": (state_key, "details", 0)},
+                    {"text": self._("btn_relations"), "callback": self._cb_extra_tab, "args": (state_key, "relations", 0)},
+                ],
+                [
+                    {"text": self._("btn_behavior"), "callback": self._cb_extra_tab, "args": (state_key, "behavior", 0)},
+                    {"text": self._("btn_community"), "callback": self._cb_extra_tab, "args": (state_key, "community", 0)},
+                ],
+            ])
+        else:
+            markup.append([
+                {"text": self._("btn_details"), "callback": self._cb_extra_tab, "args": (state_key, "details", 0)},
+                {"text": self._("btn_community"), "callback": self._cb_extra_tab, "args": (state_key, "community", 0)},
+            ])
+            markup.append([
+                {"text": self._("btn_url_domain"), "callback": self._cb_extra_tab, "args": (state_key, "url_domain", 0)}
+            ])
         return markup
 
     def _history_list_markup(self, page: int):
@@ -518,7 +563,10 @@ class VirusTotalChecker(loader.Module):
                     self.last_backoff = 2.0
                     ctype = resp.headers.get("Content-Type", "")
                     if "application/json" in ctype:
-                        return await resp.json()
+                        try:
+                            return await resp.json(content_type=None)
+                        except (aiohttp.ClientError, ValueError, TypeError):
+                            return {"error": "parse"}
                     return {"ok": True, "status": resp.status}
 
                 if resp.status == 204:
@@ -537,6 +585,9 @@ class VirusTotalChecker(loader.Module):
 
                 if resp.status == 404:
                     return None
+
+                if resp.status == 403:
+                    return {"error": "http_403"}
 
                 if resp.status == 429:
                     retry_after = resp.headers.get("Retry-After")
@@ -568,6 +619,11 @@ class VirusTotalChecker(loader.Module):
             return {"error": "timeout"}
         except aiohttp.ClientError:
             return {"error": "network"}
+        except (ValueError, TypeError, OSError):
+            return {"error": "request_data"}
+        except Exception:
+            # Prevent unexpected transport/decoder errors from crashing Hikka handlers.
+            return {"error": "internal"}
 
     async def _analysis_wait(self, session, analysis_id: str):
         for _ in range(ANALYSIS_POLLS):
@@ -750,6 +806,113 @@ class VirusTotalChecker(loader.Module):
                 h.update(chunk)
         return h.hexdigest()
 
+    def _threat_profile(self, stats: dict, threats: list) -> dict:
+        """Build a transparent heuristic threat/risk summary from VT verdicts."""
+        stats = stats if isinstance(stats, dict) else {}
+        def _count(key):
+            try:
+                return max(0, int(stats.get(key, 0) or 0))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
+        malicious = _count("malicious")
+        suspicious = _count("suspicious")
+        harmless = _count("harmless")
+        undetected = _count("undetected")
+        timeout = _count("timeout")
+        failure = _count("failure")
+        total = malicious + suspicious + harmless + undetected + timeout + failure
+        detections = malicious + suspicious
+        detection_pct = (detections / total * 100.0) if total else None
+        # Suspicious verdicts weigh half as much as confirmed malicious verdicts.
+        risk_pct = ((malicious + suspicious * 0.5) / total * 100.0) if total else None
+
+        is_ru = self.lang == "ru"
+        labels = {
+            "Trojan": "Троян" if is_ru else "Trojan",
+            "Ransomware": "Вымогатель (Ransomware)" if is_ru else "Ransomware",
+            "Spyware": "Шпионское ПО (Spyware)" if is_ru else "Spyware",
+            "Adware": "Рекламное ПО (Adware)" if is_ru else "Adware",
+            "Worm": "Червь (Worm)" if is_ru else "Worm",
+            "Backdoor": "Бэкдор (Backdoor)" if is_ru else "Backdoor",
+            "Rootkit": "Руткит (Rootkit)" if is_ru else "Rootkit",
+            "Keylogger": "Кейлоггер (Keylogger)" if is_ru else "Keylogger",
+            "Downloader": "Загрузчик (Downloader)" if is_ru else "Downloader",
+            "Dropper": "Дроппер (Dropper)" if is_ru else "Dropper",
+            "Virus": "Вирус" if is_ru else "Virus",
+            "Phishing": "Фишинг" if is_ru else "Phishing",
+            "Exploit": "Эксплойт" if is_ru else "Exploit",
+        }
+        patterns = {
+            "Ransomware": ("ransom", "cryptor", "cryptolocker"),
+            "Spyware": ("spyware", "stealer", "infosteal", "passwordsteal"),
+            "Keylogger": ("keylog",),
+            "Backdoor": ("backdoor", "rat.", "remoteaccess"),
+            "Rootkit": ("rootkit",),
+            "Worm": ("worm",),
+            "Adware": ("adware", "advert"),
+            "Downloader": ("downloader",),
+            "Dropper": ("dropper",),
+            "Phishing": ("phish",),
+            "Exploit": ("exploit",),
+            "Trojan": ("trojan", "trj", "troj"),
+            "Virus": ("virus", "fileinfector"),
+        }
+        counts = {name: 0 for name in patterns}
+        for item in threats or []:
+            try:
+                signature = str(item[1]).lower()
+            except (TypeError, IndexError):
+                continue
+            for kind, needles in patterns.items():
+                if any(token in signature for token in needles):
+                    counts[kind] += 1
+        detected_kinds = sorted(((count, kind) for kind, count in counts.items() if count), reverse=True)
+        if detected_kinds:
+            top = detected_kinds[0][0]
+            kinds = [labels[kind] for count, kind in detected_kinds if count == top]
+            threat_type = ", ".join(kinds[:3])
+        elif detections:
+            threat_type = "Не удалось точно классифицировать" if is_ru else "Unclassified detection"
+        else:
+            threat_type = "Не выявлен" if is_ru else "Not detected"
+
+        if risk_pct is None:
+            risk_label = "Недостаточно данных" if is_ru else "Insufficient data"
+        elif risk_pct >= 30:
+            risk_label = "КРИТИЧЕСКИЙ" if is_ru else "CRITICAL"
+        elif risk_pct >= 15:
+            risk_label = "ВЫСОКИЙ" if is_ru else "HIGH"
+        elif risk_pct >= 5:
+            risk_label = "УМЕРЕННЫЙ" if is_ru else "MODERATE"
+        elif detections:
+            risk_label = "НИЗКИЙ, но есть срабатывания" if is_ru else "LOW, detections present"
+        else:
+            risk_label = "НИЗКИЙ" if is_ru else "LOW"
+        return {"type": threat_type, "detection_pct": detection_pct, "risk_pct": risk_pct,
+                "risk_label": risk_label, "total": total, "detections": detections}
+
+    def _render_risk_summary(self, stats: dict, threats: list) -> str:
+        profile = self._threat_profile(stats, threats)
+        is_ru = self.lang == "ru"
+        if profile["detection_pct"] is None:
+            detection = "н/д" if is_ru else "n/a"
+            risk = "н/д" if is_ru else "n/a"
+        else:
+            detection = f"{profile['detection_pct']:.1f}%"
+            risk = f"{profile['risk_pct']:.1f}%"
+        if is_ru:
+            return ("\n\n🧬 <b>Классификация угрозы:</b> " + profile["type"] +
+                    "\n📊 <b>Процент обнаружений:</b> " + detection +
+                    "\n⚠️ <b>Оценка риска:</b> " + risk + " — <b>" + profile["risk_label"] + "</b>" +
+                    f"\n🔎 <b>Сработало движков:</b> {profile['detections']} из {profile['total']}" +
+                    "\n<i>Оценка эвристическая: подозрительные срабатывания учитываются с половинным весом; это не вероятность заражения.</i>")
+        return ("\n\n🧬 <b>Threat classification:</b> " + profile["type"] +
+                "\n📊 <b>Detection rate:</b> " + detection +
+                "\n⚠️ <b>Risk score:</b> " + risk + " — <b>" + profile["risk_label"] + "</b>" +
+                f"\n🔎 <b>Triggered engines:</b> {profile['detections']} of {profile['total']}" +
+                "\n<i>Heuristic estimate: suspicious verdicts count half; this is not the probability of infection.</i>")
+
     def _render_result_text(self, state: dict) -> str:
         res = state["result"]
         meta = state["meta"]
@@ -780,6 +943,7 @@ class VirusTotalChecker(loader.Module):
         )
 
         threats = res.get("threats", [])
+        text += self._render_risk_summary(stats, threats)
         if not threats:
             text += self._("no_detections")
             return text
@@ -794,6 +958,411 @@ class VirusTotalChecker(loader.Module):
             text += self._("detection_item", engine=engine, threat=threat)
 
         return text
+
+    def _extra_object_id(self, result: dict) -> str:
+        if result.get("type") in ("file", "hash"):
+            return result.get("sha256") or ""
+        return result.get("id") or ""
+
+    def _display_value(self, value, limit: int = 900) -> str:
+        if value is None or value == "":
+            return "—"
+        if isinstance(value, bool):
+            if self.lang == "ru":
+                return "да" if value else "нет"
+            return "yes" if value else "no"
+        if isinstance(value, (dict, list, tuple)):
+            value = ", ".join(str(x) for x in value) if isinstance(value, (list, tuple)) else "; ".join(f"{k}: {v}" for k, v in value.items())
+        value = str(value).replace("\x00", "")
+        value = value if len(value) <= limit else value[:limit - 1] + "…"
+        return html.escape(value, quote=False)
+
+    def _unix_date(self, value) -> str:
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(int(value)))
+        except (TypeError, ValueError, OverflowError):
+            return self._display_value(value)
+
+    async def _get_extra_object(self, session, result: dict):
+        object_id = self._extra_object_id(result)
+        if not object_id:
+            return {"error": "missing_object_id"}
+        kind = "files" if result.get("type") in ("file", "hash") else "urls"
+        return await self._request(session, "GET", f"{VT_API}/{kind}/{object_id}")
+
+    async def _get_relationship(self, session, sha256: str, relationship: str):
+        return await self._request(
+            session, "GET", f"{VT_API}/files/{sha256}/{relationship}", params={"limit": 10}
+        )
+
+    async def _load_extra_tab(self, result: dict, tab: str):
+        object_id = self._extra_object_id(result)
+        if not object_id:
+            return {"error": "missing_object_id"}
+
+        async with aiohttp.ClientSession() as session:
+            if tab == "details":
+                data = await self._get_extra_object(session, result)
+                if not isinstance(data, dict) or data.get("error"):
+                    return data or {"error": "unavailable"}
+                try:
+                    return {"attributes": data["data"]["attributes"]}
+                except (KeyError, TypeError):
+                    return {"error": "parse"}
+
+            if tab == "relations":
+                if result.get("type") not in ("file", "hash"):
+                    return {"error": "unavailable"}
+                names = (
+                    "contacted_domains", "contacted_ips", "contacted_urls",
+                    "execution_parents", "execution_children", "dropped_files",
+                )
+                output = {}
+                for name in names:
+                    data = await self._get_relationship(session, object_id, name)
+                    if isinstance(data, dict) and not data.get("error"):
+                        output[name] = data.get("data", [])
+                    elif isinstance(data, dict) and data.get("error") not in ("http_403", "http_404"):
+                        output[name] = {"error": data.get("error")}
+                    else:
+                        output[name] = []
+                return {"relationships": output}
+
+            if tab == "behavior":
+                if result.get("type") not in ("file", "hash"):
+                    return {"error": "unavailable"}
+                summary = await self._request(session, "GET", f"{VT_API}/files/{object_id}/behaviour_summary")
+                reports = await self._request(session, "GET", f"{VT_API}/files/{object_id}/behaviours", params={"limit": 10})
+                if (not summary or (isinstance(summary, dict) and summary.get("error"))) and (not reports or (isinstance(reports, dict) and reports.get("error"))):
+                    return summary or reports or {"error": "unavailable"}
+                summary_attrs = summary.get("data", {}) if isinstance(summary, dict) else {}
+                report_items = reports.get("data", []) if isinstance(reports, dict) else []
+                return {"summary": summary_attrs, "reports": report_items}
+
+            if tab == "url_domain":
+                if result.get("type") != "url":
+                    return {"error": "unavailable"}
+                url_data = await self._get_extra_object(session, result)
+                if not isinstance(url_data, dict) or url_data.get("error"):
+                    return url_data or {"error": "unavailable"}
+                url_attrs = (url_data.get("data") or {}).get("attributes") or {}
+                raw_url = result.get("url") or ""
+                try:
+                    host = (urlsplit(raw_url).hostname or "").lower().rstrip(".")
+                except (TypeError, ValueError):
+                    host = ""
+                domain_attrs = {}
+                if host:
+                    domain_data = await self._request(session, "GET", f"{VT_API}/domains/{host}")
+                    if isinstance(domain_data, dict) and not domain_data.get("error"):
+                        domain_attrs = ((domain_data.get("data") or {}).get("attributes") or {})
+                redirects = {}
+                # Some URL objects/permissions expose redirect relationships; absence is normal.
+                for rel in ("redirecting_to", "redirected_from"):
+                    rel_data = await self._request(session, "GET", f"{VT_API}/urls/{object_id}/{rel}", params={"limit": 10})
+                    if isinstance(rel_data, dict) and not rel_data.get("error"):
+                        redirects[rel] = rel_data.get("data", [])
+                    else:
+                        redirects[rel] = []
+                return {"url_attributes": url_attrs, "domain": host, "domain_attributes": domain_attrs, "redirects": redirects}
+
+            if tab == "community":
+                kind = "files" if result.get("type") in ("file", "hash") else "urls"
+                data = await self._request(session, "GET", f"{VT_API}/{kind}/{object_id}/comments", params={"limit": 10})
+                if not isinstance(data, dict) or data.get("error"):
+                    return data or {"error": "unavailable"}
+                return {"comments": data.get("data", [])}
+
+        return {"error": "unknown_tab"}
+
+    def _section(self, title: str, icon: str = "▫️") -> str:
+        return f"\n{icon} <b>{title}</b>\n━━━━━━━━━━━━━━━━━━\n"
+
+    def _render_details_tab(self, attrs: dict, state: dict) -> str:
+        is_ru = self.lang == "ru"
+        labels = [
+            ("md5", "MD5"), ("sha1", "SHA-1"), ("sha256", "SHA-256"),
+            ("vhash", "Vhash"), ("authentihash", "Authentihash"),
+            ("imphash", "Imphash"), ("ssdeep", "SSDEEP"), ("tlsh", "TLSH"),
+            ("type_description", "Тип файла" if is_ru else "File type"),
+            ("magic", "Сигнатура" if is_ru else "Magic"),
+            ("trid", "TrID"), ("detectiteasy", "Detect It Easy"), ("magika", "Magika"),
+            ("size", "Размер" if is_ru else "File size"),
+            ("reputation", "Репутация" if is_ru else "Reputation"),
+            ("meaningful_name", "Имя" if is_ru else "Meaningful name"),
+            ("times_submitted", "Отправок" if is_ru else "Submissions"),
+            ("first_submission_date", "Первая отправка" if is_ru else "First submission"),
+            ("last_submission_date", "Последняя отправка" if is_ru else "Last submission"),
+            ("last_analysis_date", "Последний анализ" if is_ru else "Last analysis"),
+            ("creation_date", "Время создания" if is_ru else "Creation time"),
+        ]
+        title = "📋 ПОДРОБНОСТИ ФАЙЛА" if is_ru else "📋 FILE DETAILS"
+        lines = [f"<b>{title}</b>", "<i>VirusTotal · Object metadata</i>"]
+        hash_keys = {"md5", "sha1", "sha256", "vhash", "authentihash", "imphash", "ssdeep", "tlsh"}
+        for key, label in labels:
+            value = attrs.get(key)
+            if value is None or value == "":
+                continue
+            if key.endswith("_date") and value:
+                value = self._unix_date(value)
+            elif key == "size":
+                value = f"{self._format_size(int(value))} ({value} bytes)"
+            value = self._display_value(value, 240)
+            if hash_keys.__contains__(key):
+                lines.append(f"<b>{label}:</b> <code>{value}</code>")
+            else:
+                lines.append(f"<b>{label}:</b> {value}")
+
+        for key, label in (("names", "Имена" if is_ru else "Known names"),
+                           ("tags", "Теги" if is_ru else "Tags"),
+                           ("type_tags", "Типы" if is_ru else "Type tags")):
+            values = attrs.get(key) or []
+            if values:
+                lines.append(self._section(label, "🏷️"))
+                for item in values[:12]:
+                    lines.append(f"• {self._display_value(item, 150)}")
+                if len(values) > 12:
+                    lines.append(f"… +{len(values) - 12}")
+
+        pe = attrs.get("pe_info") or {}
+        if isinstance(pe, dict) and pe:
+            lines.append(self._section("PE / Windows", "🧩"))
+            for key in ("machine_type", "timestamp", "rich_pe_header_hash", "import_list", "export_list"):
+                value = pe.get(key)
+                if not value:
+                    continue
+                if isinstance(value, list):
+                    value = ", ".join(str(x.get("library_name", x)) if isinstance(x, dict) else str(x) for x in value[:6])
+                lines.append(f"• <b>{key}:</b> {self._display_value(value, 220)}")
+        return "\n".join(lines)[:3900]
+
+    def _render_relations_tab(self, payload: dict) -> str:
+        is_ru = self.lang == "ru"
+        labels = {
+            "contacted_domains": "Контактировавшие домены" if is_ru else "Contacted domains",
+            "contacted_ips": "Контактировавшие IP" if is_ru else "Contacted IP addresses",
+            "contacted_urls": "Контактировавшие URL" if is_ru else "Contacted URLs",
+            "execution_parents": "Родительские файлы" if is_ru else "Execution parents",
+            "execution_children": "Дочерние файлы" if is_ru else "Execution children",
+            "dropped_files": "Созданные файлы" if is_ru else "Dropped files",
+        }
+        lines = ["<b>🔗 СВЯЗАННЫЕ ОБЪЕКТЫ</b>" if is_ru else "<b>🔗 RELATED OBJECTS</b>",
+                 "<i>VirusTotal · Relations</i>"]
+        rels = payload.get("relationships", {})
+        for key, label in labels.items():
+            items = rels.get(key, [])
+            count = len(items) if isinstance(items, list) else 0
+            lines.append(self._section(f"{label} · {count}", "🌐"))
+            if isinstance(items, dict):
+                lines.append(f"⚠️ {self._display_value(items.get('error', 'API error'), 100)}")
+            elif not items:
+                lines.append("<i>Нет данных</i>" if is_ru else "<i>No data</i>")
+            else:
+                for item in items[:8]:
+                    attrs = item.get("attributes", {}) if isinstance(item, dict) else {}
+                    name = attrs.get("name") or attrs.get("meaningful_name") or attrs.get("url") or (item.get("id", "unknown") if isinstance(item, dict) else "unknown")
+                    stats = attrs.get("last_analysis_stats", {})
+                    detections = int(stats.get("malicious", 0)) + int(stats.get("suspicious", 0)) if isinstance(stats, dict) else 0
+                    lines.append(f"• <code>{self._display_value(name, 170)}</code> · 🔴 {detections}")
+                if count > 8:
+                    lines.append(f"<i>… ещё {count - 8}</i>" if is_ru else f"<i>… {count - 8} more</i>")
+        return "\n".join(lines)[:3900]
+
+    def _render_behavior_tab(self, payload: dict) -> str:
+        is_ru = self.lang == "ru"
+        summary = payload.get("summary") or {}
+        reports = payload.get("reports") or []
+        lines = ["<b>🧪 ПОВЕДЕНЧЕСКИЙ АНАЛИЗ</b>" if is_ru else "<b>🧪 BEHAVIOR ANALYSIS</b>",
+                 "<i>VirusTotal · Sandbox intelligence</i>"]
+        fields = (
+            ("tags", "Поведенческие теги" if is_ru else "Behavior tags"),
+            ("calls_highlighted", "Подсвеченные вызовы" if is_ru else "Highlighted calls"),
+            ("command_executions", "Команды" if is_ru else "Command executions"),
+            ("files_opened", "Открытые файлы" if is_ru else "Files opened"),
+            ("files_written", "Созданные/изменённые файлы" if is_ru else "Files written"),
+            ("files_deleted", "Удалённые файлы" if is_ru else "Files deleted"),
+            ("processes_created", "Созданные процессы" if is_ru else "Processes created"),
+            ("modules_loaded", "Загруженные модули" if is_ru else "Modules loaded"),
+            ("registry_keys_set", "Изменения реестра" if is_ru else "Registry changes"),
+            ("mutexes_created", "Созданные mutex" if is_ru else "Mutexes created"),
+            ("dns_lookups", "DNS-запросы" if is_ru else "DNS lookups"),
+            ("ip_traffic", "Сетевой трафик" if is_ru else "IP traffic"),
+            ("http_conversations", "HTTP-соединения" if is_ru else "HTTP conversations"),
+            ("mitre_attack_techniques", "MITRE ATT&CK"),
+            ("sigma_analysis_results", "Sigma Rules"), ("ids_alerts", "IDS Alerts"),
+        )
+        found = False
+        for key, label in fields:
+            values = summary.get(key)
+            if not values:
+                continue
+            found = True
+            lines.append(self._section(label, "🧬"))
+            for value in values[:6] if isinstance(values, list) else [values]:
+                if isinstance(value, dict):
+                    value = value.get("rule_title") or value.get("technique") or value.get("name") or value
+                lines.append(f"• {self._display_value(value, 180)}")
+        if reports:
+            found = True
+            lines.append(self._section("Отчёты песочниц" if is_ru else "Sandbox reports", "📦"))
+            for report in reports[:8]:
+                attrs = report.get("attributes", {})
+                name = attrs.get("sandbox_name") or report.get("id", "Sandbox")
+                tags = ", ".join(attrs.get("tags", [])[:4])
+                date = self._unix_date(attrs.get("analysis_date")) if attrs.get("analysis_date") else "—"
+                lines.append(f"• <b>{self._display_value(name, 90)}</b> · {date}" + (f"\n  {self._display_value(tags, 180)}" if tags else ""))
+        if not found:
+            lines.append("\nℹ️ Нет доступных поведенческих данных." if is_ru else "\nℹ️ No behavior data is available.")
+        return "\n".join(lines)[:3900]
+
+    def _render_community_tab(self, payload: dict) -> str:
+        is_ru = self.lang == "ru"
+        comments = payload.get("comments") or []
+        title = "💬 СООБЩЕСТВО" if is_ru else "💬 COMMUNITY"
+        lines = [f"<b>{title} · {len(comments)}</b>", "<i>VirusTotal · Community comments</i>"]
+        if not comments:
+            lines.append("\nℹ️ Комментариев пока нет." if is_ru else "\nℹ️ No comments yet.")
+        for item in comments[:8]:
+            attrs = item.get("attributes", {}) if isinstance(item, dict) else {}
+            author_data = attrs.get("author")
+            author = author_data.get("name") if isinstance(author_data, dict) else author_data
+            date = self._unix_date(attrs.get("date")) if attrs.get("date") else ""
+            comment = attrs.get("text") or attrs.get("html") or attrs.get("votes", "")
+            lines.append(self._section(f"{self._display_value(author or 'unknown', 70)} · {date}", "👤"))
+            lines.append(self._display_value(comment, 420))
+        return "\n".join(lines)[:3900]
+
+    def _render_url_domain_tab(self, payload: dict) -> str:
+        ru = self.lang == "ru"
+        ua = payload.get("url_attributes") or {}
+        da = payload.get("domain_attributes") or {}
+        host = payload.get("domain") or "—"
+        lines = ["<b>🌐 URL И ДОМЕН</b>" if ru else "<b>🌐 URL & DOMAIN</b>",
+                 "<i>VirusTotal · URL intelligence</i>"]
+
+        def add(label, value, icon="▫️", limit=220):
+            if value is None or value == "":
+                return
+            lines.append(f"{icon} <b>{label}:</b> {self._display_value(value, limit)}")
+
+        lines.append(self._section("ДОМЕН" if ru else "DOMAIN", "🌍"))
+        add("Hostname", host)
+        add("Registrar" if not ru else "Регистратор", da.get("registrar"))
+        add("Страна сервера" if ru else "Server country", da.get("country") or ua.get("country"))
+        add("Дата регистрации" if ru else "Registered", self._unix_date(da.get("creation_date")) if da.get("creation_date") else None)
+        add("Истекает" if ru else "Expires", self._unix_date(da.get("expiration_date")) if da.get("expiration_date") else None)
+        add("Репутация" if ru else "Reputation", da.get("reputation"))
+
+        dns = da.get("last_dns_records") or []
+        ips = []
+        for record in dns if isinstance(dns, list) else []:
+            if isinstance(record, dict) and record.get("type") in ("A", "AAAA") and record.get("value"):
+                ips.append(record["value"])
+        add("IP-адреса" if ru else "IP addresses", ", ".join(dict.fromkeys(ips)) if ips else None, "📡")
+
+        lines.append(self._section("САЙТ И HTTP" if ru else "WEBSITE & HTTP", "🖥️"))
+        add("HTTP-статус" if ru else "HTTP status", ua.get("last_http_response_code"), "📶")
+        add("Финальный URL" if ru else "Final URL", ua.get("last_final_url"), "➡️", 300)
+        add("Категории" if ru else "Categories", ua.get("categories") or da.get("categories"), "🏷️")
+        stats = ua.get("last_analysis_stats") or da.get("last_analysis_stats") or {}
+        if isinstance(stats, dict):
+            det = int(stats.get("malicious", 0) or 0) + int(stats.get("suspicious", 0) or 0)
+            add("Обнаружения" if ru else "Detections", f"{det} / {sum(int(v or 0) for v in stats.values() if isinstance(v, (int, float)))}", "🛡️")
+        else:
+            add("Обнаружения" if ru else "Detections", None)
+        engine_results = ua.get("last_analysis_results") or da.get("last_analysis_results") or {}
+        if isinstance(engine_results, dict):
+            flagged = []
+            for engine, info in engine_results.items():
+                if isinstance(info, dict) and info.get("category") in ("malicious", "suspicious"):
+                    flagged.append((engine, info.get("result") or info.get("category")))
+            if flagged:
+                lines.append(self._section("СРАБАТЫВАНИЯ АНТИВИРУСОВ" if ru else "ANTIVIRUS DETECTIONS", "🚨"))
+                for engine, threat in flagged[:8]:
+                    lines.append(f"• <b>{self._display_value(engine, 70)}:</b> {self._display_value(threat, 130)}")
+                if len(flagged) > 8:
+                    lines.append(f"… +{len(flagged) - 8}")
+
+        cert = da.get("last_https_certificate") or ua.get("last_https_certificate") or {}
+        if isinstance(cert, dict) and cert:
+            lines.append(self._section("SSL-СЕРТИФИКАТ" if ru else "SSL CERTIFICATE", "🔒"))
+            subject = cert.get("subject") or {}
+            issuer = cert.get("issuer") or {}
+            add("Владелец" if ru else "Subject", subject.get("CN") or subject.get("O") or subject, "👤")
+            add("Издатель" if ru else "Issuer", issuer.get("CN") or issuer.get("O") or issuer, "🏢")
+            validity = cert.get("validity") or {}
+            add("Действителен с" if ru else "Valid from", validity.get("not_before"), "📅")
+            add("Действителен до" if ru else "Valid until", validity.get("not_after"), "📅")
+            add("SHA-256 отпечаток" if ru else "SHA-256 fingerprint", cert.get("thumbprint_sha256") or cert.get("thumbprint"), "🔑", 150)
+        else:
+            lines.append(self._section("SSL-СЕРТИФИКАТ" if ru else "SSL CERTIFICATE", "🔒"))
+            lines.append("ℹ️ Нет доступных данных сертификата." if ru else "ℹ️ No certificate data available.")
+
+        redirects = payload.get("redirects") or {}
+        lines.append(self._section("ПЕРЕНАПРАВЛЕНИЯ" if ru else "REDIRECTS", "↪️"))
+        found_redirect = False
+        for rel, label in (("redirecting_to", "Ведёт на" if ru else "Redirects to"), ("redirected_from", "Перенаправлен с" if ru else "Redirected from")):
+            items = redirects.get(rel) or []
+            for item in items[:8]:
+                found_redirect = True
+                attrs = item.get("attributes", {}) if isinstance(item, dict) else {}
+                target = attrs.get("url") or attrs.get("meaningful_name") or (item.get("id") if isinstance(item, dict) else item)
+                lines.append(f"• <b>{label}:</b> <code>{self._display_value(target, 240)}</code>")
+        if not found_redirect:
+            chain = ua.get("redirection_chain") or ua.get("redirect_chain") or []
+            if chain:
+                for target in chain[:8]:
+                    lines.append(f"• <code>{self._display_value(target, 240)}</code>")
+                    found_redirect = True
+        if not found_redirect:
+            lines.append("ℹ️ Перенаправления не найдены или API их не предоставил." if ru else "ℹ️ No redirects found or returned by the API.")
+
+        lines.append("\n<i>Часть полей зависит от доступности данных и уровня API VirusTotal.</i>" if ru else "\n<i>Field availability depends on VirusTotal data and API tier.</i>")
+        return "\n".join(lines)[:3900]
+
+    def _extra_tab_markup(self, state_key: str):
+        return [[{"text": self._("btn_back_report"), "callback": self._cb_extra_back, "args": (state_key,)}]]
+
+    async def _cb_extra_tab(self, call, state_key: str, tab: str, page: int = 0):
+        state = self._inline_get(state_key)
+        if not state:
+            await call.answer(self._("inline_expired"), show_alert=True)
+            return
+        try:
+            await call.answer()
+        except Exception:
+            pass
+        try:
+            await call.edit(self._("extra_loading"), reply_markup=self._extra_tab_markup(state_key))
+            payload = await self._load_extra_tab(state["result"], tab)
+            if not isinstance(payload, dict) or payload.get("error"):
+                error = payload.get("error", "unavailable") if isinstance(payload, dict) else "unavailable"
+                if error in ("http_403", "http_404", "unavailable", "missing_object_id"):
+                    text = self._("extra_unavailable")
+                else:
+                    text = self._("extra_error", error=error)
+            elif tab == "details":
+                text = self._render_details_tab(payload.get("attributes", {}), state)
+            elif tab == "relations":
+                text = self._render_relations_tab(payload)
+            elif tab == "behavior":
+                text = self._render_behavior_tab(payload)
+            elif tab == "community":
+                text = self._render_community_tab(payload)
+            elif tab == "url_domain":
+                text = self._render_url_domain_tab(payload)
+            else:
+                text = self._("extra_unavailable")
+            await call.edit(text, reply_markup=self._extra_tab_markup(state_key))
+        except Exception as e:
+            try:
+                await call.edit(self._("extra_error", error=str(e)[:100]), reply_markup=self._extra_tab_markup(state_key))
+            except Exception:
+                pass
+
+    async def _cb_extra_back(self, call, state_key: str):
+        await call.answer()
+        await self._edit_inline(call, state_key)
 
     async def _answer_inline(self, msg, state: dict):
         state_key = self._state_key(state["result"])
@@ -1014,6 +1583,10 @@ class VirusTotalChecker(loader.Module):
             "parse": self._("parse_error"),
             "too_big": self._("too_big", size=">650 MB"),
             "upload_url": self._("api_error", error="upload_url"),
+            "http_403": self._("extra_unavailable"),
+            "http_404": self._("extra_unavailable"),
+            "request_data": self._("parse_error"),
+            "internal": self._("network_error"),
         }
         text = mapping.get(err, self._("api_error", error=err))
         try:
